@@ -5,24 +5,15 @@
 #[macro_use]
 extern crate alloc;
 
-use core::{
-    char,
-    ptr::addr_of_mut,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
-};
+use core::{char, ptr::addr_of_mut};
 
 use alloc::{
-    borrow::ToOwned,
     string::{String, ToString},
     vec::Vec,
 };
 use embassy_embedded_hal::{SetConfig, shared_bus::asynch::spi::SpiDevice};
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::{
-    join,
-    select::{Either3, select3},
-    yield_now,
-};
+use embassy_futures::{join, yield_now};
 use embassy_rp::{
     Peri, bind_interrupts,
     dma::InterruptHandler as DmaIrqHandler,
@@ -43,12 +34,8 @@ use embassy_sync::{
 };
 use embassy_time::{Delay, Timer};
 use embassy_usb::{
-    Builder, Config, Handler,
-    class::{
-        cdc_acm::{CdcAcmClass, State},
-        hid::{HidProtocolMode, HidReaderWriter, ReportId, RequestHandler, State as HidState},
-    },
-    control::OutResponse,
+    Builder, Config,
+    class::cdc_acm::{CdcAcmClass, State},
 };
 use embassy_usb_logger::ReceiverHandler;
 use embedded_alloc::LlffHeap as Heap;
@@ -56,8 +43,6 @@ use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
-    text::Text, // primitives::{Circle, PrimitiveStyle, Triangle},
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{SdCard, sdcard::DummyCsPin};
@@ -213,91 +198,6 @@ impl ReceiverHandler for CmdHandler {
     }
 }
 
-struct HidRequestHandler {}
-
-impl RequestHandler for HidRequestHandler {
-    fn get_report(&mut self, id: ReportId, _buf: &mut [u8]) -> Option<usize> {
-        info!("Get report for {id:?}");
-        None
-    }
-
-    fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
-        info!("Set report for {:?}: {data:?}", id);
-        OutResponse::Accepted
-    }
-
-    fn get_protocol(&self) -> HidProtocolMode {
-        let protocol = HidProtocolMode::from(HID_PROTOCOL_MODE.load(Ordering::Relaxed));
-        info!("The current HID protocol mode is: {:?}", protocol);
-        protocol
-    }
-
-    fn set_protocol(&mut self, protocol: HidProtocolMode) -> OutResponse {
-        info!("Switching to HID protocol mode: {:?}", protocol);
-        HID_PROTOCOL_MODE.store(protocol as u8, Ordering::Relaxed);
-        OutResponse::Accepted
-    }
-
-    fn set_idle_ms(&mut self, id: Option<ReportId>, dur: u32) {
-        info!("Set idle rate for {id:?} to {dur:?}");
-    }
-
-    fn get_idle_ms(&mut self, id: Option<ReportId>) -> Option<u32> {
-        info!("Get idle rate for {id:?}");
-        None
-    }
-}
-
-struct HidDeviceHandler {
-    configured: AtomicBool,
-}
-
-impl Default for HidDeviceHandler {
-    fn default() -> Self {
-        Self {
-            configured: AtomicBool::new(false),
-        }
-    }
-}
-
-impl HidDeviceHandler {
-    fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Handler for HidDeviceHandler {
-    fn enabled(&mut self, enabled: bool) {
-        self.configured.store(false, Ordering::Relaxed);
-        if enabled {
-            info!("Device enabled");
-        } else {
-            info!("Device disabled");
-        }
-    }
-
-    fn reset(&mut self) {
-        self.configured.store(false, Ordering::Relaxed);
-        info!("Bus reset, the Vbus current limit is 100mA");
-    }
-
-    fn addressed(&mut self, addr: u8) {
-        self.configured.store(false, Ordering::Relaxed);
-        info!("USB address set to: {}", addr);
-    }
-
-    fn configured(&mut self, configured: bool) {
-        self.configured.store(configured, Ordering::Relaxed);
-        if configured {
-            info!(
-                "Device configured, it may now draw up to the configured current limit from Vbus."
-            )
-        } else {
-            info!("Device is no longer configured, the Vbus current limit is 100mA.");
-        }
-    }
-}
-
 struct DummyTimesource();
 
 impl embedded_sdmmc::TimeSource for DummyTimesource {
@@ -317,7 +217,7 @@ impl embedded_sdmmc::TimeSource for DummyTimesource {
 async fn usb_task(driver: Driver<'static, USB>) {
     // Create embassy-usb Config
     let mut config = Config::new(0xc0de, 0xcafe);
-    config.manufacturer = Some("Eoghan West <eowest@gmail.com>");
+    config.manufacturer = Some("Calacuda");
     config.product = Some("calc09");
     config.serial_number = Some("12345678");
     config.max_power = 100;
@@ -332,7 +232,6 @@ async fn usb_task(driver: Driver<'static, USB>) {
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
-    let mut device_handler = HidDeviceHandler::new();
 
     let mut logger_state = State::new();
 
@@ -347,8 +246,6 @@ async fn usb_task(driver: Driver<'static, USB>) {
 
     // Create a class for the logger
     let logger_class = CdcAcmClass::new(&mut builder, &mut logger_state, 64);
-
-    builder.handler(&mut device_handler);
 
     #[allow(static_mut_refs)]
     let log_fut = unsafe {
@@ -631,16 +528,7 @@ async fn gui(
     let mut style = MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN);
     let n_rows = (top - 8) / 10;
     let n_cols = 3;
-    let mut gui_state = GuiState {
-        script: String::new(),
-        all_scripts: Vec::new(),
-        dis_scripts: Vec::new(),
-        highlight: None,
-        cursor_loc: 0,
-        description: String::new(),
-        interpreting_line: None,
-        messages: Vec::new(),
-    };
+    let mut gui_state = GuiState {};
 
     loop {
         // Create a framebuffer for drawing
@@ -764,9 +652,9 @@ async fn main(spawner: Spawner) {
 
     // LED section
     // let led = Output::new(p.PIN_25, Level::Low);
-    // let led = Output::new(p.PIN_5, Level::Low);
+    let led = Output::new(p.PIN_5, Level::Low);
     // let led = Output::new(p.PIN_21, Level::Low);
-    // spawner.spawn(blinky(led).expect("failed to create blinky task"));
+    spawner.spawn(blinky(led).expect("failed to create blinky task"));
 
     // sd card reader thread
     let cs = Output::new(p.PIN_17, Level::High);
@@ -832,7 +720,26 @@ async fn main(spawner: Spawner) {
                 PicoCalcKeyboardButton::RShift => {}
                 PicoCalcKeyboardButton::CapsLK => {}
                 PicoCalcKeyboardButton::Text(char) => {}
-                _ => {}
+                PicoCalcKeyboardButton::F1 => {}
+                PicoCalcKeyboardButton::F2 => {}
+                PicoCalcKeyboardButton::F3 => {}
+                PicoCalcKeyboardButton::F4 => {}
+                PicoCalcKeyboardButton::F5 => {}
+                PicoCalcKeyboardButton::F6 => {}
+                PicoCalcKeyboardButton::F7 => {}
+                PicoCalcKeyboardButton::F8 => {}
+                PicoCalcKeyboardButton::F9 => {}
+                PicoCalcKeyboardButton::F10 => {}
+                PicoCalcKeyboardButton::Esc => {}
+                PicoCalcKeyboardButton::Brk => {}
+                PicoCalcKeyboardButton::Tab => {}
+                PicoCalcKeyboardButton::Home => {}
+                PicoCalcKeyboardButton::End => {}
+                PicoCalcKeyboardButton::LCTRL => {}
+                PicoCalcKeyboardButton::Alt => {}
+                PicoCalcKeyboardButton::Ins => {}
+                PicoCalcKeyboardButton::PgUp => {}
+                PicoCalcKeyboardButton::PgDown => {}
             }
         } else {
             match key {
@@ -847,7 +754,26 @@ async fn main(spawner: Spawner) {
                 PicoCalcKeyboardButton::RShift => {}
                 PicoCalcKeyboardButton::CapsLK => {}
                 PicoCalcKeyboardButton::Text(char) => {}
-                _ => {}
+                PicoCalcKeyboardButton::F1 => {}
+                PicoCalcKeyboardButton::F2 => {}
+                PicoCalcKeyboardButton::F3 => {}
+                PicoCalcKeyboardButton::F4 => {}
+                PicoCalcKeyboardButton::F5 => {}
+                PicoCalcKeyboardButton::F6 => {}
+                PicoCalcKeyboardButton::F7 => {}
+                PicoCalcKeyboardButton::F8 => {}
+                PicoCalcKeyboardButton::F9 => {}
+                PicoCalcKeyboardButton::F10 => {}
+                PicoCalcKeyboardButton::Esc => {}
+                PicoCalcKeyboardButton::Brk => {}
+                PicoCalcKeyboardButton::Tab => {}
+                PicoCalcKeyboardButton::Home => {}
+                PicoCalcKeyboardButton::End => {}
+                PicoCalcKeyboardButton::LCTRL => {}
+                PicoCalcKeyboardButton::Alt => {}
+                PicoCalcKeyboardButton::Ins => {}
+                PicoCalcKeyboardButton::PgUp => {}
+                PicoCalcKeyboardButton::PgDown => {}
             }
         }
     }

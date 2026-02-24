@@ -41,7 +41,7 @@ docs: server-docs open-docs
 _new-tmux-dev-session:
   tmux new -ds "$SESSION" -n "README"
   tmux send-keys -t "$SESSION":README 'nv ./README.md "+set wrap"' ENTER
-  @just _new-window "Edit" "nv ./src/*.rs"
+  @just _new-window "Edit" "nv ./src/{main,*}.rs"
   @just _new-window "Cargo" ""
   @just _new-window "Misc" ""
   @just _new-window "Git" "git status"

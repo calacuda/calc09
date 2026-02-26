@@ -101,10 +101,8 @@ pub async fn mixer_task(
                     play_heads.retain(|head| head.i < head.drum_sound.len());
                     // let sample = libm::tanhf(sample * 0.8);
                     let sample = (sample * 4) / 5;
-                    // let sample = sample as i64 + i32::MIN.abs() as i64;
-                    // let sample = u32::from_ne_bytes(sample.to_ne_bytes());
-                    // let sample = sample as u32;
-                    let sample = sample as u32 * (u32::MAX / 16_777_215); // 0x10001;
+                    // for 24 bit input samples (16_777_215 == u24::MAX)
+                    let sample = sample as u32 * (u32::MAX / 16_777_215);
 
                     *s = sample;
                 }

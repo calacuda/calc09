@@ -7,10 +7,9 @@ extern crate alloc;
 
 use core::{char, ptr::addr_of_mut};
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use crate::mixer_task_i2s::{MixerCMD, Sample};
+
+use alloc::{string::ToString, vec::Vec};
 use embassy_embedded_hal::{SetConfig, shared_bus::asynch::spi::SpiDevice};
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::{join, yield_now};
@@ -21,11 +20,12 @@ use embassy_rp::{
     i2c::InterruptHandler as I2cIrqHandler,
     multicore::{Stack, spawn_core1},
     peripherals::{
-        DMA_CH0, DMA_CH1, I2C1, PIN_6, PIN_7, PIN_10, PIN_11, PIN_12, PIN_16, PIN_18, PIN_19, SPI0,
-        SPI1, USB,
+        DMA_CH0, DMA_CH1, DMA_CH2, I2C1, PIN_6, PIN_7, PIN_10, PIN_11, PIN_12, PIN_16, PIN_18,
+        PIN_19, PIO0, SPI0, SPI1, USB,
     },
+    pio::{InterruptHandler as PioIrqHandler, Pio},
     spi::{self, Async, Spi},
-    usb::{Driver, InterruptHandler as UsbIrqHandler},
+    usb::{Driver, Instance, InterruptHandler as UsbIrqHandler},
 };
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
@@ -35,9 +35,9 @@ use embassy_sync::{
 use embassy_time::{Delay, Timer};
 use embassy_usb::{
     Builder, Config,
-    class::cdc_acm::{CdcAcmClass, State},
+    class::midi::{MidiClass, USB_AUDIO_CLASS},
+    driver::EndpointError,
 };
-use embassy_usb_logger::ReceiverHandler;
 use embedded_alloc::LlffHeap as Heap;
 use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
@@ -53,11 +53,13 @@ use lcd_async::{
     raw_framebuf::RawFrameBuf,
 };
 use log::*;
+use nwav::{Chunk, WAV};
 use static_cell::StaticCell;
-
-use defmt_rtt as _;
+use {defmt_rtt as _, panic_probe as _};
 
 pub mod key_codes;
+pub mod mixer_task;
+pub mod mixer_task_i2s;
 
 pub static SCREEN_W: u16 = 320;
 // pub static SCREEN_W: u16 = 80;
@@ -95,17 +97,19 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrqHandler<USB>;
     I2C1_IRQ => I2cIrqHandler<embassy_rp::peripherals::I2C1>;
-    DMA_IRQ_0 => DmaIrqHandler<DMA_CH0>, DmaIrqHandler<DMA_CH1>;
+    DMA_IRQ_0 => DmaIrqHandler<DMA_CH0>, DmaIrqHandler<DMA_CH1>, DmaIrqHandler<DMA_CH2>;
+    PIO0_IRQ_0 => PioIrqHandler<PIO0>;
 });
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
-const HEAP_SIZE: usize = 128 * 1024;
+const HEAP_SIZE: usize = 256 * 1024;
 
-static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, String, 4> = Channel::new();
+// static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, String, 4> = Channel::new();
 static PC_KB_CHANNEL: Channel<CriticalSectionRawMutex, (PicoCalcKeyboardButton, bool), 4> =
     Channel::new();
 static GUI_STATE: Channel<CriticalSectionRawMutex, GuiState, 4> = Channel::new();
+static MIXER_CTRL: Channel<CriticalSectionRawMutex, MixerCMD, 4> = Channel::new();
 
 // Keyboard I2C stuff
 pub const _REG_VER: u8 = 0x01; //  fw version
@@ -172,32 +176,6 @@ pub struct GuiState {}
 
 impl GuiState {}
 
-pub struct CmdHandler {}
-
-impl ReceiverHandler for CmdHandler {
-    fn new() -> Self {
-        Self {}
-    }
-
-    async fn handle_data(&self, data: &[u8]) {
-        match core::str::from_utf8(data) {
-            Ok(cmd) => {
-                info!("recv a command {cmd}");
-                // let mut buf = [0u8; 256];
-                // COMMAND_CHANNEL.send(cmd.to_string()).await;
-
-                if cmd.starts_with("/greet ") {
-                    let name = &cmd[7..cmd.len()];
-                    info!("Hello, {name}!");
-                } else if cmd.starts_with("/") {
-                    error!("unknown command!");
-                }
-            }
-            Err(e) => error!("messeage failed to parse with error: {e}. (likely invalid utf8)"),
-        };
-    }
-}
-
 struct DummyTimesource();
 
 impl embedded_sdmmc::TimeSource for DummyTimesource {
@@ -213,6 +191,17 @@ impl embedded_sdmmc::TimeSource for DummyTimesource {
     }
 }
 
+struct Disconnected {}
+
+impl From<EndpointError> for Disconnected {
+    fn from(val: EndpointError) -> Self {
+        match val {
+            EndpointError::BufferOverflow => panic!("Buffer overflow"),
+            EndpointError::Disabled => Disconnected {},
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn usb_task(driver: Driver<'static, USB>) {
     // Create embassy-usb Config
@@ -223,7 +212,8 @@ async fn usb_task(driver: Driver<'static, USB>) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     config.composite_with_iads = false;
-    config.device_class = 0;
+    config.device_class = USB_AUDIO_CLASS;
+    // config.device_class = 0;
     config.device_sub_class = 0;
     config.device_protocol = 0;
 
@@ -232,8 +222,6 @@ async fn usb_task(driver: Driver<'static, USB>) {
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
-
-    let mut logger_state = State::new();
 
     let mut builder = Builder::new(
         driver,
@@ -244,37 +232,39 @@ async fn usb_task(driver: Driver<'static, USB>) {
         &mut control_buf,
     );
 
-    // Create a class for the logger
-    let logger_class = CdcAcmClass::new(&mut builder, &mut logger_state, 64);
-
-    #[allow(static_mut_refs)]
-    let log_fut = unsafe {
-        static mut LOGGER: ::embassy_usb_logger::UsbLogger<1024, CmdHandler> =
-            ::embassy_usb_logger::UsbLogger::with_custom_style(|record, writer| {
-                use core::fmt::Write;
-                let level = record.level().as_str();
-
-                if record
-                    .target()
-                    .starts_with(&env!("CARGO_PKG_NAME").replace("-", "_"))
-                {
-                    write!(writer, "[{level}] {}\r\n", record.args(),).unwrap();
-                }
-            });
-        LOGGER.with_handler(CmdHandler {});
-        let _ = ::log::set_logger_racy(&LOGGER)
-            .map(|()| log::set_max_level_racy(log::LevelFilter::Debug));
-
-        LOGGER.create_future_from_class(logger_class)
-    };
+    // midi usb class
+    let mut midi_class = MidiClass::new(&mut builder, 1, 1, 64);
 
     // Build the builder.
     let mut usb = builder.build();
 
-    // Run the USB device.
-    let usb_fut = usb.run();
+    // Use the Midi class!
+    let midi_fut = async {
+        loop {
+            midi_class.wait_connection().await;
+            info!("Connected");
 
-    join::join(log_fut, usb_fut).await;
+            if midi_echo(&mut midi_class).await.is_err() {
+                error!("device disconnected");
+            }
+
+            info!("Disconnected");
+        }
+    };
+
+    join::join(midi_fut, usb.run()).await;
+}
+
+async fn midi_echo<'d, T: Instance + 'd>(
+    class: &mut MidiClass<'d, Driver<'d, T>>,
+) -> Result<(), Disconnected> {
+    let mut buf = [0; 64];
+    loop {
+        let n = class.read_packet(&mut buf).await?;
+        let data = &buf[..n];
+        info!("data: {:x?}", data);
+        class.write_packet(data).await?;
+    }
 }
 
 #[embassy_executor::task]
@@ -641,20 +631,40 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner| {
-                // task for serial logging & other usb stuff
-                let driver = Driver::new(p.USB, Irqs);
+                // Setup pio state machine for i2s output
+                let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+                let bit_clock_pin = p.PIN_2;
+                let left_right_clock_pin = p.PIN_3;
+                let data_pin = p.PIN_4;
 
-                // run USB HID and logging in its own thread
-                spawner.spawn(usb_task(driver).expect("failed to crate usb task"));
+                // mixer task
+                spawner.spawn(
+                    mixer_task_i2s::mixer_task(
+                        bit_clock_pin,
+                        left_right_clock_pin,
+                        data_pin,
+                        common,
+                        sm0,
+                        p.DMA_CH2,
+                        MIXER_CTRL.receiver(),
+                    )
+                    .expect("failed to spawn mixer task"),
+                );
             })
         },
     );
 
-    // LED section
+    // task for usb midi stuff
+    let driver = Driver::new(p.USB, Irqs);
+
+    // run USB HID and logging in its own thread
+    spawner.spawn(usb_task(driver).expect("failed to crate usb task"));
+
+    // // LED section
     // let led = Output::new(p.PIN_25, Level::Low);
-    let led = Output::new(p.PIN_5, Level::Low);
+    // let led = Output::new(p.PIN_5, Level::Low);
     // let led = Output::new(p.PIN_21, Level::Low);
-    spawner.spawn(blinky(led).expect("failed to create blinky task"));
+    // spawner.spawn(blinky(led).expect("failed to create blinky task"));
 
     // sd card reader thread
     let cs = Output::new(p.PIN_17, Level::High);
@@ -662,12 +672,7 @@ async fn main(spawner: Spawner) {
     let mosi = p.PIN_19;
     let miso = p.PIN_16;
     spawner.spawn(
-        sd_card_reader(
-            // dc,
-            cs, // rst,
-            clk, mosi, miso, p.SPI0,
-        )
-        .expect("failed to spawn sd card reader task"),
+        sd_card_reader(cs, clk, mosi, miso, p.SPI0).expect("failed to spawn sd card reader task"),
     );
 
     // display driver thread
@@ -702,6 +707,7 @@ async fn main(spawner: Spawner) {
     );
 
     info!("Hello, world!");
+    let mut id = 0;
 
     let mut gui_state = GuiState {};
 
@@ -709,7 +715,74 @@ async fn main(spawner: Spawner) {
         let (key, was_pressed) = PC_KB_CHANNEL.receive().await;
         if !was_pressed {
             match key {
-                PicoCalcKeyboardButton::Enter => {}
+                PicoCalcKeyboardButton::Enter => {
+                    let wav = WAV::from_data(include_bytes!("../test_data/SN3.WAV"));
+                    let chunks = wav.available_chunks();
+                    let mut samples: Vec<Sample> = Vec::new();
+
+                    chunks.iter().for_each(|c| {
+                        let Some(chunk) = wav.read_chunk(c) else {
+                            return;
+                        };
+                        let num_bytes = 3;
+                        let Chunk::Data(bytes) = chunk else {
+                            return;
+                        };
+                        let mut pos = 0;
+
+                        // while pos < c.data_length {
+                        while pos < bytes.len() {
+                            let sign = bytes[pos + 2] >> 7;
+                            let sign_byte = if sign == 1 { 0xff } else { 0x0 };
+
+                            let sample = i32::from_le_bytes([
+                                bytes[pos],
+                                bytes[pos + 1],
+                                bytes[pos + 2],
+                                sign_byte,
+                            ]);
+
+                            samples.push(sample);
+                            // samples.push((sample as f64 / 16777215.) as f32);
+
+                            pos += num_bytes;
+                        }
+                    });
+
+                    // let wav = WAV::from_data(include_bytes!("../test_data/SN3.16.WAV"));
+                    // let chunks = wav.available_chunks();
+                    // let mut samples: Vec<Sample> = Vec::new();
+                    //
+                    // chunks.iter().for_each(|c| {
+                    //     let Some(chunk) = wav.read_chunk(c) else {
+                    //         return;
+                    //     };
+                    //     let num_bytes = 2;
+                    //     let Chunk::Data(bytes) = chunk else {
+                    //         return;
+                    //     };
+                    //     let mut pos = 0;
+                    //
+                    //     while pos < bytes.len() {
+                    //         let sample = i16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+                    //
+                    //         samples.push(sample);
+                    //
+                    //         pos += num_bytes;
+                    //     }
+                    // });
+
+                    MIXER_CTRL
+                        .send(MixerCMD::Play {
+                            drum_sound: samples.into(),
+                            volume: 1.0,
+                            id,
+                        })
+                        .await;
+
+                    id += 1;
+                    id %= u8::MAX;
+                }
                 PicoCalcKeyboardButton::ArrowUp => {}
                 PicoCalcKeyboardButton::ArrowDown => {}
                 PicoCalcKeyboardButton::ArrowLeft => {}
@@ -781,8 +854,8 @@ async fn main(spawner: Spawner) {
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+#[defmt::panic_handler]
+fn panic() -> ! {
     let p = embassy_rp::init(Default::default());
     let mut led = Output::new(p.PIN_21, Level::Low);
     led.set_high();

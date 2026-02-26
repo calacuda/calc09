@@ -29,6 +29,10 @@ embassy-usb-logger = { git = "https://github.com/embassy-rs/embassy", version = 
 embassy-usb = { git = "https://github.com/embassy-rs/embassy", version = "0.5.1", features = ["log"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", version = "0.5.0", features = ["log"] }
 embedded-hal-bus = { version = "0.3.0", features = ["async", "alloc"] }
+libm = "0.2.16"
+nwav = "0.1.2"
+# waverly = "0.2.0"
+# wavv = "0.2.1"
 
 [profile.dev]
 codegen-units = 1
